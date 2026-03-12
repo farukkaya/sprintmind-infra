@@ -1,0 +1,161 @@
+# =============================================================================
+# SprintMind | docker-compose.yml
+# Geliştirme + test ortamı
+#
+# Servisler:
+#   nginx     → Ters proxy, statik dosya sunucusu (port 80)
+#   api       → ASP.NET Core 8 + SignalR (port 5000, dışarıya kapalı)
+#   postgres  → PostgreSQL 16 + pgvector (port 5432, dışarıya kapalı)
+#   redis     → Oturum cache + JWT store (port 6379, dışarıya kapalı)
+#   ollama    → Lokal AI model servisi (port 11434, dışarıya kapalı)
+#
+# Kullanım:
+#   docker compose up -d              → tüm servisleri başlat
+#   docker compose up -d postgres     → sadece postgres başlat
+#   docker compose logs -f api        → api loglarını takip et
+#   docker compose down               → tüm servisleri durdur
+#   docker compose down -v            → servisleri + volume'ları sil (dikkat!)
+# =============================================================================
+
+services:
+
+  # ── Nginx — Ters Proxy ─────────────────────────────────────────────────────
+  # Dışarıya açık tek servis budur (port 80).
+  # React build çıktısını servis eder, API ve SignalR trafiğini yönlendirir.
+  nginx:
+    image: nginx:alpine
+    container_name: sprintmind-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      # HTTPS için: - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      # React build çıktısı buraya kopyalanır: npm run build → frontend-dist/
+      - ./frontend-dist:/usr/share/nginx/html:ro
+      # SSL sertifikası hazır olunca bu satırı aç:
+      # - ./nginx/ssl:/etc/nginx/ssl:ro
+    # depends_on:
+    #   - api
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── ASP.NET Core API ───────────────────────────────────────────────────────
+  # Dışarıya kapalı — sadece Nginx üzerinden erişilir.
+  # Geliştirme sırasında Rider/VS'den direkt çalıştırılırsa bu servis
+  # docker-compose'dan çıkarılabilir.
+  # api:
+  #   build:
+  #     context: ../sprintmind-api          # api reposunun yolu
+  #     dockerfile: Dockerfile
+  #   container_name: sprintmind-api
+  #   restart: unless-stopped
+  #   # ports dışarıya açılmaz — Nginx internal network üzerinden ulaşır
+  #   expose:
+  #     - "5000"
+  #   environment:
+  #     - ASPNETCORE_ENVIRONMENT=Production
+  #     - ASPNETCORE_URLS=http://+:5000
+  #     - ConnectionStrings__Default=Host=postgres;Port=5432;Database=sprintmind;Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}
+  #     - Redis__ConnectionString=redis:6379
+  #     - Ollama__BaseUrl=http://ollama:11434
+  #     - Jwt__Secret=${JWT_SECRET}
+  #     - Jwt__Issuer=SprintMind
+  #     - Jwt__Audience=SprintMindUsers
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - sprintmind-net
+
+  # ── PostgreSQL 16 + pgvector ───────────────────────────────────────────────
+  # pgvector/pgvector:pg16 image'ı içinde pgvector kurulu gelir.
+  # init/ klasöründeki SQL dosyaları ilk açılışta otomatik çalışır.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: sprintmind-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"   # Geliştirme sırasında DBeaver/DataGrip bağlantısı için açık
+                      # Production'da bu satırı kaldır veya 127.0.0.1:5432:5432 yap
+    environment:
+      POSTGRES_DB: sprintmind
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro   # 01, 02, 03 SQL'ler burada
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d sprintmind"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  # Oturum durumu, JWT refresh token ve AI analiz cache'i için.
+  redis:
+    image: redis:7-alpine
+    container_name: sprintmind-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"   # Geliştirme sırasında açık — production'da kapat
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes   # AOF: veri kayıplarını önler
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Ollama — Lokal AI Model Servisi ───────────────────────────────────────
+  # Mistral 7B ve nomic-embed-text modelleri burada çalışır.
+  # İlk kurulumda modelleri indirmek gerekir (aşağıya bak).
+  # GPU varsa: deploy → resources → reservations kısmını aç.
+  ollama:
+    image: ollama/ollama
+    container_name: sprintmind-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"   # Geliştirme sırasında açık — production'da kapat
+    volumes:
+      - ollama_models:/root/.ollama   # İndirilen modeller burada kalır
+    networks:
+      - sprintmind-net
+    # GPU desteği için bu bloğu aç (NVIDIA driver kurulu olmalı):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+
+# ── Kalıcı Veri ──────────────────────────────────────────────────────────────
+# 'docker compose down' yapıldığında bunlar SİLİNMEZ.
+# 'docker compose down -v' yapılırsa SİLİNİR — dikkat!
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_models:
+
+
+# ── İç Ağ ────────────────────────────────────────────────────────────────────
+# Tüm servisler bu ağ üzerinden birbirine container adıyla ulaşır.
+# Örnek: API içinden postgres'e "Host=postgres" yazılır, IP gerekmez.
+networks:
+  sprintmind-net:
+    driver: bridge
