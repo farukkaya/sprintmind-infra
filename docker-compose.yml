@@ -87,7 +87,7 @@ services:
       - "5432:5432"   # Geliştirme sırasında DBeaver/DataGrip bağlantısı için açık
                       # Production'da bu satırı kaldır veya 127.0.0.1:5432:5432 yap
     environment:
-      POSTGRES_DB: sprintmind
+      POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:

@@ -1,0 +1,177 @@
+# =============================================================================
+# SprintMind | docker-compose.prod.yml
+# Production ortamı
+#
+# Geliştirme (docker-compose.yml) ile farkları:
+#   - Tüm portlar dışarıya kapalı (sadece nginx:80 açık)
+#   - restart: always
+#   - API servisi aktif (Dockerfile hazır olunca build eder)
+#   - Resource limitleri tanımlı
+#
+# Kullanım:
+#   docker compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml logs -f api
+#   docker compose -f docker-compose.prod.yml down
+# =============================================================================
+
+services:
+
+  # ── Nginx — Ters Proxy ─────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: sprintmind-nginx
+    restart: always
+    ports:
+      - "80:80"
+      # HTTPS hazır olunca:
+      # - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./frontend-dist:/usr/share/nginx/html:ro
+      # - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+
+  # ── ASP.NET Core API ───────────────────────────────────────────────────────
+  # ⚠️  API Dockerfile hazır olana kadar bu servis yorum satırında kalacak.
+  #     Hazır olunca aşağıdaki yorumları kaldır ve nginx/conf.d/sprintmind.conf'taki
+  #     proxy blokları da aç.
+  api:
+    build:
+      context: ../sprintmind-api
+      dockerfile: Dockerfile
+    container_name: sprintmind-api
+    restart: always
+    expose:
+      - "5000"          # Dışarıya kapalı — sadece Nginx erişir
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:5000
+      - ConnectionStrings__Default=Host=postgres;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USER};Password=${POSTGRES_PASSWORD}
+      - Redis__ConnectionString=redis:6379
+      - Ollama__BaseUrl=http://ollama:11434
+      - Jwt__Secret=${JWT_SECRET}
+      - Jwt__Issuer=SprintMind
+      - Jwt__Audience=SprintMindUsers
+      - Jwt__ExpiryMinutes=60
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+
+  # ── PostgreSQL 16 + pgvector ───────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: sprintmind-postgres
+    restart: always
+    # Production'da port dışarıya kapalı — sadece internal erişim
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+
+  # ── Redis 7 ───────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: sprintmind-redis
+    restart: always
+    expose:
+      - "6379"          # Dışarıya kapalı
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    networks:
+      - sprintmind-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ── Ollama — Lokal AI ─────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama
+    container_name: sprintmind-ollama
+    restart: always
+    expose:
+      - "11434"         # Dışarıya kapalı — sadece API erişir
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - sprintmind-net
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+    # NVIDIA GPU desteği için bu bloğu aç:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_models:
+
+networks:
+  sprintmind-net:
+    driver: bridge
